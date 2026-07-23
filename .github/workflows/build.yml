@@ -1,0 +1,36 @@
+name: build
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          pip install pyinstaller requests customtkinter pystray pillow syncedlyrics pyaudiowpatch numpy "shazamio==0.4.0.1" audioop-lts faster-whisper segno pykakasi pypinyin korean-romanizer
+          pip install "numpy>=2.1" winrt-runtime winrt-Windows.Media.Control winrt-Windows.Foundation winrt-Windows.Foundation.Collections winrt-Windows.Storage.Streams
+      - name: Build exe
+        run: cmd /c build.bat
+      - name: Build lite exe
+        run: cmd /c build_lite.bat
+        continue-on-error: true
+      - name: Upload to release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload ${{ github.ref_name }} dist/Lyrio*.exe --clobber
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Lyrio-exe
+          path: dist/Lyrio*.exe
