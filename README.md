@@ -15,11 +15,15 @@
 
 > **Resumen en español:** Lyrio muestra la letra sincronizada de lo que suene en tu PC (Spotify, YouTube o cualquier reproductor) flotando sobre la pantalla. Identifica la canción escuchándola (estilo Shazam), la sincroniza con IA local cuando no existe sincronización en ninguna fuente, y es completamente gratis. Descarga el `.exe` portable desde **Releases**; no requiere instalador, cuentas ni Python. Único autor y creador: **EazyHood**.
 
-![Floating lyrics](docs/overlay.gif)
+<div align="center">
+  <img src="docs/overlay.gif" alt="Floating lyrics" width="640"/>
+</div>
 
 ## What it does / Qué hace
 
-![Main window](docs/app.png)
+<div align="center">
+  <img src="docs/app.png" alt="Main window" width="760"/>
+</div>
 
 - **Floating lyrics overlay** — transparent background, always on top, draggable, click-through ghost mode, word-by-word karaoke sweep, 4 style themes (Classic, Cartoon, Neon, Minimal), adjustable width, 1–3 visible lines, alignment, font and color.
 - **Finds any lyric** — 8 sources searched in order and validated by artist + duration: lrclib, Musixmatch, QQ Music, Kugou, NetEase, letras.com, Genius, lyrics.ovh.
