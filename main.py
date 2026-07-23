@@ -87,10 +87,24 @@ class LyrioApp:
         self._fetching2 = None
         self._id_tried = set()         # tracks ya identificados por audio
         self._identifying = False
-        self.autosync_ai = AutoSyncAI(self._on_ai_sync)
+        self.autosync_ai = AutoSyncAI(
+            self._on_ai_sync,
+            model_getter=lambda: self.cfg.get("ai_model", "base"))
         self._ai_tried = set()
         self._radio = None             # modo radio: sin sesion SMTC
         self._radio_last_try = 0.0
+        self._last_playing_mono = time.monotonic()
+        from translate import Translator
+        self.translator = Translator()
+        self._rom_cache = {}
+        self.party = None              # modo fiesta (pantalla completa)
+        self._now = {}                 # estado publico (companero movil)
+        from phone import PhoneServer
+        self.phone = PhoneServer(lambda: dict(self._now))
+        if self.cfg.get("phone_server"):
+            self.phone.start()
+        threading.Thread(target=self._check_update, daemon=True,
+                         name="update-check").start()
         self.hotkeys = GlobalHotkeys(
             lambda action: self.ui_call(self._hotkey, action))
         if self.cfg.get("hotkeys", True):
@@ -248,8 +262,8 @@ class LyrioApp:
         class _Shim:
             show_window = self.show_window
             on_quit = self.on_quit
-            reload_lyrics = staticmethod(lambda: None)
-            adjust_offset = staticmethod(lambda d: None)
+            reload_lyrics = self.reload_lyrics2
+            adjust_offset = self.adjust_offset2
             on_ghost_changed = staticmethod(lambda on: None)
 
         self.overlay2 = LyricsOverlay(self.root, self.cfg, controller=_Shim(),
@@ -291,7 +305,7 @@ class LyrioApp:
                                  t("searching") if self._fetching2 == key
                                  else t("no_lyrics"))
             return
-        pos = st.position_now()
+        pos = st.position_now() + getattr(self, "_offset2", 0.0)
         idx = self.line_index(lyr, pos)
         current = lyr.lines[idx][1] if idx >= 0 else "…"
         nxt = ""
@@ -301,6 +315,65 @@ class LyrioApp:
                 break
         self.overlay2.render(current or "…", nxt,
                              "" if st.playing else t("paused"))
+
+    # ------------------------------------- fiesta / movil / updates
+
+    def toggle_party(self):
+        from party import PartyWindow
+        if self.party:
+            self.party.close()
+            return
+        self.party = PartyWindow(self.root, self.cfg,
+                                 on_close=self._party_closed)
+
+    def _party_closed(self):
+        self.party = None
+
+    def set_phone_server(self, on):
+        ok = self.phone.start() if on else (self.phone.stop() or True)
+        if ok:
+            self.cfg.set("phone_server", bool(on))
+        return ok and (self.phone.running == bool(on))
+
+    def phone_url(self):
+        return self.phone.url if self.phone.running else ""
+
+    def set_translate(self, on):
+        self.cfg.set("translate", bool(on))
+
+    def set_romanize(self, on):
+        self.cfg.set("romanize", bool(on))
+
+    def set_ai_model(self, name):
+        self.cfg.set("ai_model", name)
+
+    def adjust_offset2(self, delta):
+        self._offset2 = 0.0 if delta is None else \
+            round(getattr(self, "_offset2", 0.0) + delta, 2)
+
+    def reload_lyrics2(self):
+        st = self.watcher.get_state2()
+        if st.title:
+            clear_cache_entry(st.artist, st.title, st.duration)
+        self._key2 = None
+        self._lyrics2 = None
+
+    def _check_update(self):
+        """Aviso de version nueva en GitHub (a los 12 s de arrancar)."""
+        time.sleep(12)
+        try:
+            import requests
+            from appconfig import APP_VERSION
+            r = requests.get("https://api.github.com/repos/EazyHood/Lyrio"
+                             "/releases/latest", timeout=10)
+            tag = (r.json().get("tag_name") or "").lstrip("v")
+            if tag and tuple(map(int, tag.split("."))) > \
+                    tuple(map(int, APP_VERSION.split("."))):
+                self.ui_call(self.window.flash_status,
+                             t("update_available", v=tag), 12000)
+                self.tray.notify(t("update_available", v=tag))
+        except Exception:
+            pass
 
     # ------------------------------------- identificacion por audio (Shazam)
 
@@ -403,7 +476,7 @@ class LyrioApp:
 
         self.autosync_ai.start(key, pos_getter, lyr.lines, st.duration)
 
-    def _on_ai_sync(self, key, lines):
+    def _on_ai_sync(self, key, lines, word_times=None):
         """La IA termino de alinear (hilo propio)."""
         st = self._cal_state if (self._cal_state and
                                  self._cal_state.track_key == key) else None
@@ -411,7 +484,8 @@ class LyrioApp:
         ref = st or (now if now.track_key == key else None)
         if ref is None:
             return
-        lyr = save_ai_sync(ref.artist, ref.title, ref.duration, lines)
+        lyr = save_ai_sync(ref.artist, ref.title, ref.duration, lines,
+                           words=word_times)
         log.info("IA sincronizo: %s (%d lineas)", ref.title, len(lines))
         with self._lock:
             if self._lyrics_key == key or self._current_key == key:
@@ -529,6 +603,13 @@ class LyrioApp:
         log.info("=== Lyrio cerrando ===")
         self._stop_event.set()
         try:
+            self.phone.stop()
+            self.translator.stop()
+            if self.party:
+                self.party.close()
+        except Exception:
+            pass
+        try:
             self.watcher.stop()
             self.tray.stop()
         finally:
@@ -545,6 +626,7 @@ class LyrioApp:
         self.audiocal.cancel()
         self.autosync_ai.cancel()
         self._radio = None
+        self.translator.reset()
         if _is_ad(state) or state.duration > 1200:
             return
         self._start_fetch(state)
@@ -612,24 +694,37 @@ class LyrioApp:
         """Sin sesion multimedia: escuchar igual (modo radio). Reconoce la
         cancion por el audio del sistema y muestra su letra sincronizada
         usando el offset de Shazam como reloj."""
-        r = self._radio
-        if r and r.get("lyr"):
-            pos = r["song_pos"] + (time.monotonic() - r["at_mono"])
-            lyr = r["lyr"]
-            last = lyr.lines[-1][0] if lyr.lines else 0
-            if pos > last + 20:
-                self._radio = None      # la cancion ya debio terminar
-            else:
-                idx = self.line_index(lyr, pos)
-                cur = lyr.lines[idx][1] if idx >= 0 else "…"
-                nxt = next((x for _t, x in lyr.lines[idx + 1:] if x), "")
-                self.overlay.render(cur or "…", nxt,
-                                    f'♪ {r["artist"]} - {r["title"]}'
-                                    if pos - (lyr.lines[0][0] if lyr.lines
-                                              else 0) < 6 else "")
-                return
+        if self._radio_render():
+            return
         self.overlay.render("", "", t("waiting_spotify"))
-        # reconocimiento ambiental cada 35 s (solo en modo Cualquier reproductor)
+        self._radio_try()
+
+    def _radio_render(self):
+        """Pinta la letra del modo radio si esta activa. True si pinto."""
+        r = self._radio
+        if not (r and r.get("lyr")):
+            return False
+        pos = r["song_pos"] + (time.monotonic() - r["at_mono"])
+        lyr = r["lyr"]
+        last = lyr.lines[-1][0] if lyr.lines else 0
+        if pos > last + 20:
+            self._radio = None      # la cancion ya debio terminar
+            return False
+        idx = self.line_index(lyr, pos)
+        cur = lyr.lines[idx][1] if idx >= 0 else "…"
+        nxt = next((x for _t, x in lyr.lines[idx + 1:] if x), "")
+        self.overlay.render(cur or "…", nxt,
+                            f'♪ {r["artist"]} - {r["title"]}'
+                            if pos - (lyr.lines[0][0] if lyr.lines
+                                      else 0) < 6 else "")
+        self._now = {"title": r["title"], "artist": r["artist"], "prev": "",
+                     "current": cur or "…", "next": nxt, "extra": ""}
+        if self.party:
+            self.party.render(r["title"], r["artist"], "", cur or "…", nxt)
+        return True
+
+    def _radio_try(self):
+        """Reconocimiento ambiental cada 35 s (modo Cualquier reproductor)."""
         if self.cfg.get("source_mode") != "any" or self._identifying:
             return
         if time.monotonic() - self._radio_last_try < 35:
@@ -648,6 +743,48 @@ class LyrioApp:
                                "at_mono": res["at_mono"], "lyr": lyr}
 
         identify_song(on_result)
+
+    def _extra_line(self, current):
+        """Traduccion o romanizacion de la linea actual (con cache)."""
+        if not current or current == "…":
+            return ""
+        from translate import needs_romanization, romanize
+        if self.cfg.get("romanize", True) and needs_romanization(current):
+            r = self._rom_cache.get(current)
+            if r is None:
+                r = romanize(current)
+                self._rom_cache[current] = r
+                if len(self._rom_cache) > 200:
+                    self._rom_cache.clear()
+            return r
+        if self.cfg.get("translate", False):
+            return self.translator.get(current,
+                                       self.cfg.get("language", "en"))
+        return ""
+
+    @staticmethod
+    def _line_frac(lyr, idx, pos, duration):
+        """Progreso 0..1 dentro de la linea. Si la IA dejo tiempos por
+        PALABRA reales, se usan; si no, se estima por duracion de linea."""
+        text = lyr.lines[idx][1]
+        wt = lyr.words.get(idx) if getattr(lyr, "words", None) else None
+        if wt and text:
+            n = len(text)
+            done = 0
+            for i, (tw, ce) in enumerate(wt):
+                if pos >= tw:
+                    done = ce
+                    nxt = wt[i + 1] if i + 1 < len(wt) else None
+                    if nxt and pos < nxt[0]:
+                        f = (pos - tw) / max(nxt[0] - tw, 0.05)
+                        done = ce + f * (nxt[1] - ce)
+                else:
+                    break
+            return done / n
+        t0 = lyr.lines[idx][0]
+        t1 = (lyr.lines[idx + 1][0] if idx + 1 < len(lyr.lines)
+              else max(duration, t0 + 5))
+        return (pos - t0) / max(t1 - t0, 0.5)
 
     def _tick(self):
         try:
@@ -670,6 +807,8 @@ class LyrioApp:
         else:
             key = st.track_key
             self._current_key = key
+            if st.playing:
+                self._last_playing_mono = time.monotonic()
             with self._lock:
                 lyr = self._lyrics if self._lyrics_key == key else None
                 fetching = self._fetching_key == key
@@ -723,14 +862,24 @@ class LyrioApp:
                     self.cfg.set("overlay_hint_shown", True)
                 if not st.playing:
                     status = t("paused")
-                self.overlay.render(current, nxt, status, prev=prev)
-                # progreso dentro de la linea actual (para el subrayado)
+                    # sesion pausada mucho rato pero suena OTRA cosa: radio
+                    if time.monotonic() - self._last_playing_mono > 30 and \
+                            self.cfg.get("source_mode") == "any":
+                        if self._radio_render():
+                            return
+                        self._radio_try()
+                extra = self._extra_line(current)
+                self.overlay.render(current, nxt, status, prev=prev,
+                                    extra=extra)
+                self._now = {"title": st.title, "artist": st.artist,
+                             "prev": prev, "current": current, "next": nxt,
+                             "extra": extra}
+                if self.party:
+                    self.party.render(st.title, st.artist, prev, current, nxt)
+                # progreso dentro de la linea actual (karaoke)
                 if 0 <= idx < len(lyr.lines):
-                    t0 = lyr.lines[idx][0]
-                    t1 = (lyr.lines[idx + 1][0] if idx + 1 < len(lyr.lines)
-                          else max(st.duration, t0 + 5))
-                    span = max(t1 - t0, 0.5)
-                    self.overlay.update_progress((pos - t0) / span)
+                    self.overlay.update_progress(
+                        self._line_frac(lyr, idx, pos, st.duration))
 
         # ventana (solo si esta visible)
         try:

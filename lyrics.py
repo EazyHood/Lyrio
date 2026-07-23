@@ -46,24 +46,36 @@ SUFFIX_NOISE_RE = re.compile(
 class Lyrics:
     """Resultado: lineas [(segundos, texto)], fuente y si es sync real o estimada."""
 
-    def __init__(self, lines, source, synced, estimated=False, author=""):
+    def __init__(self, lines, source, synced, estimated=False, author="",
+                 words=None):
         self.lines = lines            # list[tuple[float, str]] ordenada por tiempo
         self.source = source          # "lrclib", "musixmatch", "netease", "user"...
         self.synced = synced          # True si trae tiempos reales
         self.estimated = estimated    # True si los tiempos son estimados
         self.author = author          # firma [by:] de quien la sincronizo
+        # tiempos por PALABRA de la IA: {linea: [(t, char_fin), ...]}
+        self.words = words or {}
 
     def to_dict(self):
-        return {"lines": self.lines, "source": self.source,
-                "synced": self.synced, "estimated": self.estimated,
-                "author": self.author}
+        d = {"lines": self.lines, "source": self.source,
+             "synced": self.synced, "estimated": self.estimated,
+             "author": self.author}
+        if self.words:
+            d["words"] = {str(k): v for k, v in self.words.items()}
+        return d
 
     @staticmethod
     def from_dict(d):
         lines = [(float(t), str(x)) for t, x in d.get("lines", [])]
+        words = {}
+        try:
+            for k, v in (d.get("words") or {}).items():
+                words[int(k)] = [(float(t), int(c)) for t, c in v]
+        except Exception:
+            words = {}
         return Lyrics(lines, str(d.get("source", "cache")),
                       bool(d.get("synced")), bool(d.get("estimated")),
-                      str(d.get("author", "")))
+                      str(d.get("author", "")), words)
 
 
 # ---------------------------------------------------------------- utilidades
@@ -549,12 +561,12 @@ def clear_cache_entry(artist, title, duration):
         pass
 
 
-def save_ai_sync(artist, title, duration, lines):
+def save_ai_sync(artist, title, duration, lines, words=None):
     """Guarda la sincronizacion hecha por la IA escuchando la cancion."""
     lines = sorted(((round(float(t), 2), str(x)) for t, x in lines),
                    key=lambda p: p[0])
     lyr = Lyrics([list(p) for p in lines], "ai", True, estimated=False,
-                 author="Lyrio AI")
+                 author="Lyrio AI", words=words)
     return _save(_cache_path(artist, title, duration), lyr)
 
 

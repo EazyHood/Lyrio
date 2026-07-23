@@ -14,7 +14,7 @@ CONFIG_DIR = os.path.join(os.environ.get("APPDATA", "."), "Lyrio")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 
 APP_NAME = "Lyrio"
-APP_VERSION = "2.0.0"
+APP_VERSION = "1.1.0"
 
 MUTEX_NAME = "Local\\Lyrio_SingleInstance"
 SHOW_EVENT_NAME = "Local\\Lyrio_ShowWindow"
@@ -27,6 +27,10 @@ DEFAULTS = {
     "tray_notice_shown": False,
     "overlay_hint_shown": False,
     "source_mode": "spotify",     # spotify | any (cualquier reproductor SMTC)
+    "translate": False,           # traduccion en vivo (Ollama local)
+    "romanize": True,             # romanizar letras CJK
+    "phone_server": False,        # companero movil (servidor LAN)
+    "ai_model": "base",           # modelo whisper: base | small
     "hotkeys": True,              # atajos globales Ctrl+Alt+...
     "sync_author": "",            # firma [by:] al publicar sincronizaciones
     "overlay": {

@@ -650,6 +650,55 @@ class MainWindow:
             "<FocusOut>", lambda e: self.cfg.set(
                 "sync_author", self.author_entry.get().strip()))
 
+        # extras: traduccion, romanizacion, fiesta, movil, modelo IA
+        cx = card()
+        sec(cx, "lbl_extras")
+        self.translate_switch = ctk.CTkSwitch(
+            cx, text="", progress_color=ACCENT, font=_font(13),
+            text_color=TEXT,
+            command=lambda: self.app.set_translate(
+                bool(self.translate_switch.get())))
+        self.translate_switch.pack(anchor="w", padx=20, pady=(0, 4))
+        if self.cfg.get("translate"):
+            self.translate_switch.select()
+        self.romanize_switch = ctk.CTkSwitch(
+            cx, text="", progress_color=ACCENT, font=_font(13),
+            text_color=TEXT,
+            command=lambda: self.app.set_romanize(
+                bool(self.romanize_switch.get())))
+        self.romanize_switch.pack(anchor="w", padx=20, pady=(0, 4))
+        if self.cfg.get("romanize", True):
+            self.romanize_switch.select()
+        prow = ctk.CTkFrame(cx, fg_color="transparent")
+        prow.pack(fill="x", padx=20, pady=(0, 4))
+        self.phone_switch = ctk.CTkSwitch(
+            prow, text="", progress_color=ACCENT, font=_font(13),
+            text_color=TEXT, command=self._on_phone)
+        self.phone_switch.pack(side="left")
+        if self.cfg.get("phone_server"):
+            self.phone_switch.select()
+        self.btn_qr = ctk.CTkButton(
+            prow, text="", width=110, height=26, corner_radius=13,
+            fg_color=CARD_2, hover_color=BORDER, text_color=TEXT,
+            font=_font(12), command=self._show_qr)
+        self.btn_qr.pack(side="left", padx=12)
+        arow = ctk.CTkFrame(cx, fg_color="transparent")
+        arow.pack(fill="x", padx=20, pady=(0, 4))
+        self.lbl_ai_model = ctk.CTkLabel(arow, text="", font=_font(13),
+                                         text_color=TEXT, anchor="w")
+        self.lbl_ai_model.pack(side="left")
+        self.ai_seg = ctk.CTkSegmentedButton(
+            arow, values=["base", "small"],
+            command=self.app.set_ai_model, **seg)
+        self.ai_seg.pack(side="left", padx=12)
+        self.ai_seg.set(self.cfg.get("ai_model", "base"))
+        self.btn_party = ctk.CTkButton(
+            cx, text="", height=32, corner_radius=16, font=_font(13, "bold"),
+            fg_color=ACCENT, hover_color=("#0f7c37", "#25d165"),
+            text_color=("#ffffff", "#08130c"),
+            command=self.app.toggle_party)
+        self.btn_party.pack(anchor="w", padx=20, pady=(6, 14))
+
         # sistema
         c4 = card()
         sec(c4, "lbl_system")
@@ -753,6 +802,13 @@ class MainWindow:
         self.global_offset_reset.configure(text=t("reset"))
         self.lbl_author.configure(text=t("sync_author_label"))
         self.lbl_system.configure(text="WINDOWS")
+        self.lbl_extras.configure(text=t("lbl_extras").upper())
+        self.translate_switch.configure(text=t("translate_label"))
+        self.romanize_switch.configure(text=t("romanize_label"))
+        self.phone_switch.configure(text=t("phone_label"))
+        self.btn_qr.configure(text=t("phone_qr_btn"))
+        self.lbl_ai_model.configure(text=t("ai_model_label"))
+        self.btn_party.configure(text=t("party_mode"))
         self.autostart_switch.configure(text=t("autostart"))
         self.hotkeys_switch.configure(text=t("hotkeys_label"))
         self.btn_clear_cache.configure(text=t("clear_cache_btn"))
@@ -1147,6 +1203,44 @@ class MainWindow:
 
     def _on_hotkeys(self):
         self.app.set_hotkeys(bool(self.hotkeys_switch.get()))
+
+    def _on_phone(self):
+        on = bool(self.phone_switch.get())
+        if not self.app.set_phone_server(on):
+            (self.phone_switch.deselect if on else
+             self.phone_switch.select)()
+
+    def _show_qr(self):
+        import os
+        import tempfile
+        from phone import make_qr_png
+        if not self.app.phone.running:
+            self.phone_switch.select()
+            if not self.app.set_phone_server(True):
+                self.phone_switch.deselect()
+                return
+        url = self.app.phone_url()
+        png = os.path.join(tempfile.gettempdir(), "lyrio_qr.png")
+        dlg = ctk.CTkToplevel(self.root)
+        dlg.title(t("phone_qr_title"))
+        dlg.geometry("360x460")
+        dlg.transient(self.root)
+        dlg.configure(fg_color=BG)
+        ctk.CTkLabel(dlg, text=t("phone_qr_title"), font=_font(17, "bold"),
+                     text_color=TEXT).pack(pady=(18, 6))
+        if make_qr_png(url, png):
+            try:
+                from PIL import Image
+                img = Image.open(png)
+                self._qr_img = ctk.CTkImage(light_image=img, dark_image=img,
+                                            size=(260, 260))
+                ctk.CTkLabel(dlg, text="", image=self._qr_img).pack(pady=6)
+            except Exception:
+                pass
+        ctk.CTkLabel(dlg, text=url, font=_font(15, "bold"),
+                     text_color=ACCENT).pack(pady=(4, 2))
+        ctk.CTkLabel(dlg, text=t("phone_qr_hint"), font=_font(12),
+                     text_color=MUTED, wraplength=300).pack(padx=20)
 
     def _on_seek_frac(self, frac):
         st = self.app.watcher.get_state()

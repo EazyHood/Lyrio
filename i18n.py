@@ -141,6 +141,19 @@ STRINGS = {
         "ai_synced": "AI synced this song by listening to it ♪",
         "source_ai": "AI-synced (listened & aligned)",
 
+        # v6: traduccion, fiesta, movil, updates
+        "translate_label": "Live translation (local AI, Ollama)",
+        "romanize_label": "Romanize Japanese / Korean / Chinese lyrics",
+        "party_mode": "Party mode (fullscreen lyrics)",
+        "party_exit_hint": "Esc or click to exit",
+        "phone_label": "Phone companion (same Wi-Fi)",
+        "phone_qr_btn": "Show QR",
+        "phone_qr_title": "Open on your phone",
+        "phone_qr_hint": "Scan with your phone camera (same Wi-Fi network).",
+        "update_available": "New version v{v} available on GitHub!",
+        "ai_model_label": "AI sync model",
+        "lbl_extras": "Extras",
+
         # extras
         "still_running": "Lyrio keeps running in the tray. Right-click the icon to quit.",
         "no_lyrics_hint": "Try \"Wrong lyrics?\" or \"Search again\" on the left.",
@@ -295,6 +308,18 @@ STRINGS = {
                          "de la canción."),
         "ai_synced": "La IA sincronizó esta canción escuchándola ♪",
         "source_ai": "Sincronizada por IA (escuchada y alineada)",
+
+        "translate_label": "Traducción en vivo (IA local, Ollama)",
+        "romanize_label": "Romanizar letras en japonés / coreano / chino",
+        "party_mode": "Modo fiesta (letra a pantalla completa)",
+        "party_exit_hint": "Esc o clic para salir",
+        "phone_label": "Compañero móvil (misma Wi-Fi)",
+        "phone_qr_btn": "Mostrar QR",
+        "phone_qr_title": "Ábrelo en tu teléfono",
+        "phone_qr_hint": "Escanéalo con la cámara (misma red Wi-Fi).",
+        "update_available": "¡Nueva versión v{v} disponible en GitHub!",
+        "ai_model_label": "Modelo de la IA de sincronía",
+        "lbl_extras": "Extras",
 
         "still_running": "Lyrio sigue en la bandeja. Clic derecho en el icono para salir.",
         "no_lyrics_hint": "Prueba \"¿Letra equivocada?\" o \"Buscar de nuevo\" a la izquierda.",

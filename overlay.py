@@ -110,6 +110,7 @@ class LyricsOverlay:
         self._prev = ""
         self._current = ""
         self._next = ""
+        self._extra = ""              # traduccion / romanizacion de la actual
         self._status = ""
         self._progress = 0.0
         self._progress_geom = None    # (x0, y, maxw) del subrayado
@@ -167,15 +168,17 @@ class LyricsOverlay:
 
     # ------------------------------------------------------------- publico
 
-    def render(self, current, nxt, status="", prev=""):
+    def render(self, current, nxt, status="", prev="", extra=""):
         if self._destroyed:
             return
         changed_line = current != self._current and current and self._current
-        if (prev, current, nxt, status) == (self._prev, self._current,
-                                            self._next, self._status):
+        if (prev, current, nxt, status, extra) == (
+                self._prev, self._current, self._next, self._status,
+                self._extra):
             return
         self._prev, self._current, self._next = prev, current, nxt
         self._status = status
+        self._extra = extra
         if changed_line:
             self._animate_line()
         else:
@@ -390,6 +393,12 @@ class LyricsOverlay:
         else:
             y += self.font_main.metrics("linespace")
 
+        if self._extra:
+            # traduccion / romanizacion de la linea actual
+            self._outlined_text(ax, y, self._extra, self.font_ctx, "#9fd6b4",
+                                anchor, justify, wrap)
+            y = c.bbox("all")[3] + self.px(6)
+
         if mode >= 2 and self._next:
             ntxt = self._next.upper() if self.ov.get("caps") else self._next
             self._outlined_text(ax, y, ntxt, self.font_ctx, NEXT_COLOR,
@@ -516,7 +525,9 @@ class LyricsOverlay:
             for hwnd in (self._hwnd(),
                          u.GetAncestor(self.grip.winfo_id(), GA_ROOT)):
                 if hwnd:
-                    u.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                    # HWND_TOP (0): re-eleva DENTRO de la banda topmost; con
+                    # HWND_TOPMOST no sube si otra app topmost se puso encima
+                    u.SetWindowPos(hwnd, 0, 0, 0, 0, 0,
                                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
         except Exception:
             pass

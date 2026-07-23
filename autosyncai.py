@@ -30,8 +30,9 @@ def _norm_word(w):
 class AutoSyncAI:
     """start() graba+transcribe+alinea en un hilo; on_result(lines|None)."""
 
-    def __init__(self, on_result):
+    def __init__(self, on_result, model_getter=None):
         self._on_result = on_result
+        self._model_getter = model_getter or (lambda: "base")
         self._cancel = threading.Event()
         self._busy = False
 
@@ -64,12 +65,13 @@ class AutoSyncAI:
             pos0 = self._capture(wav, pos_getter, cancel, duration)
             if pos0 is None or cancel.is_set():
                 return
-            words = self._transcribe(wav)
+            words = self._transcribe(wav, self._model_getter())
             if not words or cancel.is_set():
                 return
-            synced = self._align(lines, words, pos0)
-            if synced:
-                self._on_result(key, synced)
+            result = self._align(lines, words, pos0)
+            if result:
+                synced, word_times = result
+                self._on_result(key, synced, word_times)
         except Exception:
             pass
         finally:
@@ -138,13 +140,14 @@ class AutoSyncAI:
                 pass
 
     @staticmethod
-    def _transcribe(wav_path):
+    def _transcribe(wav_path, model_name="base"):
         """[(t_rel, palabra)] con Whisper local (CPU int8, portable)."""
         try:
             from faster_whisper import WhisperModel
         except ImportError:
             return None
-        model = WhisperModel("base", device="cpu", compute_type="int8")
+        model = WhisperModel(model_name if model_name in ("base", "small")
+                             else "base", device="cpu", compute_type="int8")
         segs, _info = model.transcribe(wav_path, word_timestamps=True,
                                        vad_filter=True, beam_size=1)
         out = []
@@ -158,26 +161,36 @@ class AutoSyncAI:
     @staticmethod
     def _align(lines, words, pos0):
         """Alinea la letra conocida con la transcripcion (palabra a palabra)."""
-        line_tokens = []      # (indice_linea, token)
+        line_tokens = []      # (indice_linea, char_fin_en_linea, token)
         for i, (_t, text) in enumerate(lines):
-            for tok in re.findall(r"\S+", text):
-                nt = _norm_word(tok)
+            for m in re.finditer(r"\S+", text):
+                nt = _norm_word(m.group())
                 if nt:
-                    line_tokens.append((i, nt))
+                    line_tokens.append((i, m.end(), nt))
         if not line_tokens or not words:
             return None
-        a = [tok for _i, tok in line_tokens]
+        a = [tok for _i, _e, tok in line_tokens]
         b = [tok for _t, tok in words]
         sm = SequenceMatcher(None, a, b, autojunk=False)
         anchors = {}          # linea -> tiempo de su primera palabra anclada
+        word_times = {}       # linea -> [(t_cancion, char_fin)] palabra a palabra
         for blk in sm.get_matching_blocks():
             for k in range(blk.size):
-                li = line_tokens[blk.a + k][0]
+                li, cend, _tok = line_tokens[blk.a + k]
                 t_song = pos0 + words[blk.b + k][0]
                 if li not in anchors or t_song < anchors[li]:
                     anchors[li] = t_song
+                word_times.setdefault(li, []).append((round(t_song, 2), cend))
         if len(anchors) < max(3, MIN_MATCH_RATIO * len(lines)):
             return None
+        # limpiar tiempos de palabra: orden y monotonia dentro de cada linea
+        for li, wl in word_times.items():
+            wl.sort(key=lambda p: p[1])
+            clean = []
+            for t, ce in wl:
+                if not clean or (t > clean[-1][0] and ce > clean[-1][1]):
+                    clean.append((t, ce))
+            word_times[li] = clean
         # construir tiempos: anclas + interpolacion en huecos, monotonia forzada
         n = len(lines)
         times = [None] * n
@@ -198,4 +211,5 @@ class AutoSyncAI:
         for i in range(1, n):
             if times[i] <= times[i - 1]:
                 times[i] = times[i - 1] + 0.3
-        return [(round(times[i], 2), lines[i][1]) for i in range(n)]
+        synced = [(round(times[i], 2), lines[i][1]) for i in range(n)]
+        return synced, word_times
