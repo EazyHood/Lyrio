@@ -1,8 +1,19 @@
-# Lyrio
+<div align="center">
+  <img src="docs/logo.png" width="110" alt="Lyrio"/>
 
-Floating, synced lyrics for anything playing on your PC — Spotify, YouTube, or any player. Free to use. Made by **EazyHood**.
+  # Lyrio
 
-Letras flotantes y sincronizadas para lo que suene en tu PC — Spotify, YouTube o cualquier reproductor. Gratis. Hecho por **EazyHood**.
+  **Floating, synced lyrics for anything playing on your PC — with AI sync and Shazam-style song recognition.**
+
+  ![Release](https://img.shields.io/github/v/release/EazyHood/Lyrio?label=release&color=1db954)
+  ![Downloads](https://img.shields.io/github/downloads/EazyHood/Lyrio/total?color=1db954)
+  ![License](https://img.shields.io/badge/license-free%20with%20attribution-brightgreen)
+  ![Windows](https://img.shields.io/badge/Windows-10%2F11%20x64-0078d4)
+
+  [Download](https://github.com/EazyHood/Lyrio/releases/latest) | [Report a bug](https://github.com/EazyHood/Lyrio/issues/new) | [Privacy](#privacy--privacidad) | [License](LICENSE)
+</div>
+
+> **Resumen en español:** Lyrio muestra la letra sincronizada de lo que suene en tu PC (Spotify, YouTube o cualquier reproductor) flotando sobre la pantalla. Identifica la canción escuchándola (estilo Shazam), la sincroniza con IA local cuando no existe sincronización en ninguna fuente, y es completamente gratis. Descarga el `.exe` portable desde **Releases**; no requiere instalador, cuentas ni Python. Único autor y creador: **EazyHood**.
 
 ![Floating lyrics](docs/overlay.gif)
 
@@ -51,6 +62,19 @@ Build the exe with `build.bat` (PyInstaller).
 ## Privacy / Privacidad
 
 Everything runs locally. No account, no telemetry. Audio is captured only from your own system output, analyzed in memory/temp and discarded. Lyrics are fetched from public sources and cached locally (auto-pruned). Publishing to lrclib is manual and anonymous (only your chosen signature is embedded).
+
+## Roadmap
+
+Planned for future versions (in no particular order):
+
+- Live translation line under the lyrics (local LLM, offline).
+- Romanization for Japanese / Korean / Chinese lyrics.
+- True word-level karaoke from the AI's word timestamps (enhanced LRC), including publishing it to lrclib.
+- Overlay on top of exclusive-fullscreen games.
+- Party mode: full-screen lyrics view for a TV or projector.
+- Companion view on your phone (same Wi-Fi, QR to open).
+- Auto-update check against GitHub Releases.
+- Slimmer "lite" build (AI downloads on first use instead of shipping inside the exe).
 
 ## License / Licencia
 
