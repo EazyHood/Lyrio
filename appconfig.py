@@ -14,7 +14,7 @@ CONFIG_DIR = os.path.join(os.environ.get("APPDATA", "."), "Lyrio")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 
 APP_NAME = "Lyrio"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.1"
 
 MUTEX_NAME = "Local\\Lyrio_SingleInstance"
 SHOW_EVENT_NAME = "Local\\Lyrio_ShowWindow"
@@ -29,6 +29,8 @@ DEFAULTS = {
     "source_mode": "spotify",     # spotify | any (cualquier reproductor SMTC)
     "translate": False,           # traduccion en vivo (Ollama local)
     "romanize": True,             # romanizar letras CJK
+    "romanization_language": "auto",  # auto | ja | zh | ko
+    "auto_update": True,          # descargar; aplicar al salir de verdad
     "phone_server": False,        # companero movil (servidor LAN)
     "ai_model": "base",           # modelo whisper: base | small
     "hotkeys": True,              # atajos globales Ctrl+Alt+...

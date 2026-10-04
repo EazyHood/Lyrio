@@ -5,6 +5,10 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+concurrency:
+  group: lyrio-build-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   windows:
     runs-on: windows-latest
@@ -17,20 +21,178 @@ jobs:
           python-version: "3.12"
       - name: Install dependencies
         run: |
-          pip install pyinstaller requests customtkinter pystray pillow syncedlyrics pyaudiowpatch numpy "shazamio==0.4.0.1" audioop-lts faster-whisper segno pykakasi pypinyin korean-romanizer
-          pip install "numpy>=2.1" winrt-runtime winrt-Windows.Media.Control winrt-Windows.Foundation winrt-Windows.Foundation.Collections winrt-Windows.Storage.Streams
+          # Python 3.12 includes audioop. Keep local and release builds identical.
+          python -m pip install -r requirements-build.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pip check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify release version and tests
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          IS_TAG: ${{ startsWith(github.ref, 'refs/tags/') }}
+        run: |
+          if ($env:IS_TAG -eq 'true') {
+            python -c "import os; from appconfig import APP_VERSION; from updater import stable_version; tag=os.environ['RELEASE_TAG']; assert stable_version(tag) is not None and tag == 'v' + APP_VERSION, f'Release tag {tag} must match stable APP_VERSION {APP_VERSION}'"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          python -m unittest discover -s tests -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build exe
         run: cmd /c build.bat
       - name: Build lite exe
         run: cmd /c build_lite.bat
-        continue-on-error: true
-      - name: Upload to release
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Download native inference smoke model
         env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release upload ${{ github.ref_name }} dist/Lyrio*.exe --clobber
+          HF_HUB_DISABLE_IMPLICIT_TOKEN: '1'
+        run: |
+          $env:LYRIO_SMOKE_MODEL = Join-Path $env:RUNNER_TEMP 'LyrioModel'
+          "LYRIO_SMOKE_MODEL=$env:LYRIO_SMOKE_MODEL" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          @'
+          import json
+          import os
+          from pathlib import Path
+          from huggingface_hub import snapshot_download
+
+          files = ["config.json", "model.bin", "tokenizer.json", "vocabulary.txt"]
+          model = Path(snapshot_download(
+              "Systran/faster-whisper-tiny",
+              revision="d90ca5fe260221311c53c58e660288d3deb8d356",
+              local_dir=os.environ["LYRIO_SMOKE_MODEL"],
+              allow_patterns=files,
+              token=False,
+          ))
+          for name in files:
+              path = model / name
+              assert path.is_file() and path.stat().st_size > 0, f"Incomplete model: {name}"
+          assert (model / "model.bin").stat().st_size > 1_000_000, "Missing native model weights"
+          for name in ("config.json", "tokenizer.json"):
+              json.loads((model / name).read_text(encoding="utf-8"))
+          print("Pinned tiny model is ready for offline native inference")
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Smoke test packaged applications
+        run: |
+          $versionMatch = [regex]::Match((Get-Content -LiteralPath 'appconfig.py' -Raw), '(?m)^APP_VERSION\s*=\s*"([^"]+)"')
+          if (-not $versionMatch.Success) { throw 'Could not read APP_VERSION' }
+          $expectedVersion = $versionMatch.Groups[1].Value
+          $failures = [Collections.Generic.List[string]]::new()
+          $checks = @(
+            @{ Name = 'Lyrio.exe'; Channel = 'full'; Ai = $true; Id = 'full'; NativeInference = $false },
+            @{ Name = 'Lyrio-Lite.exe'; Channel = 'lite'; Ai = $false; Id = 'lite'; NativeInference = $false },
+            @{ Name = 'Lyrio.exe'; Channel = 'full'; Ai = $true; Id = 'full-ai'; NativeInference = $true }
+          )
+          foreach ($check in $checks) {
+            $report = [IO.Path]::GetFullPath((Join-Path 'dist' ('self-test-' + $check.Id + '.json')))
+            $process = $null
+            try {
+              Remove-Item -LiteralPath $report -Force -ErrorAction SilentlyContinue
+              $sandbox = Join-Path $env:RUNNER_TEMP ('lyrio-smoke-' + [Guid]::NewGuid().ToString('N'))
+              $roaming = Join-Path $sandbox 'Roaming'
+              $local = Join-Path $sandbox 'Local'
+              $temporary = Join-Path $sandbox 'Temp'
+              New-Item -ItemType Directory -Path $roaming, $local, $temporary -Force | Out-Null
+              $start = [Diagnostics.ProcessStartInfo]::new()
+              $start.FileName = [IO.Path]::GetFullPath((Join-Path 'dist' $check.Name))
+              $start.WorkingDirectory = $PWD.Path
+              $start.UseShellExecute = $false
+              $start.CreateNoWindow = $true
+              $start.WindowStyle = [Diagnostics.ProcessWindowStyle]::Hidden
+              if ($check.NativeInference) { $start.ArgumentList.Add('--self-test-ai') }
+              else { $start.ArgumentList.Add('--self-test') }
+              $start.ArgumentList.Add($report)
+              if ($check.NativeInference) { $start.ArgumentList.Add($env:LYRIO_SMOKE_MODEL) }
+              $start.Environment['APPDATA'] = $roaming
+              $start.Environment['LOCALAPPDATA'] = $local
+              $start.Environment['TEMP'] = $temporary
+              $start.Environment['TMP'] = $temporary
+              $start.Environment['HF_HUB_OFFLINE'] = '1'
+              $start.Environment['PYINSTALLER_RESET_ENVIRONMENT'] = '1'
+              $process = [Diagnostics.Process]::Start($start)
+              $timeout = if ($check.NativeInference) { 300000 } else { 120000 }
+              if (-not $process.WaitForExit($timeout)) {
+                # Kill only this launched process and its own PyInstaller child.
+                $process.Kill($true)
+                $null = $process.WaitForExit(10000)
+                throw "Packaged self-test timed out after $($timeout / 1000) seconds"
+              }
+              if ($process.ExitCode -ne 0) { throw "Packaged self-test exited with code $($process.ExitCode)" }
+              if (-not (Test-Path -LiteralPath $report -PathType Leaf)) { throw 'Packaged self-test did not write a report' }
+              $result = Get-Content -LiteralPath $report -Raw -Encoding UTF8 | ConvertFrom-Json
+              if ($result.status -ne 'passed' -or $result.version -ne $expectedVersion -or
+                  $result.channel -ne $check.Channel -or $result.automatic_updates -ne $true -or
+                  $result.ai_available -ne $check.Ai -or
+                  ($check.NativeInference -and $result.ai_inference -ne $true)) {
+                throw "Packaged self-test report is invalid: $(Get-Content -LiteralPath $report -Raw)"
+              }
+              # The report is written by the Python child. The parent must also
+              # exit successfully and remove its extraction directory afterward.
+              if (-not $result.extraction_dir -or
+                  (Test-Path -LiteralPath $result.extraction_dir) -or
+                  @(Get-ChildItem -LiteralPath $temporary -Directory -Filter '_MEI*').Count -ne 0) {
+                throw 'Packaged self-test left its PyInstaller extraction directory behind'
+              }
+              Write-Host "$($check.Id): offline self-test and package cleanup passed"
+            } catch {
+              $message = "$($check.Id): $($_.Exception.Message)"
+              $failures.Add($message)
+              Write-Warning $message
+              if (-not (Test-Path -LiteralPath $report)) {
+                @{ status = 'failed'; channel = $check.Channel; error = $message } |
+                  ConvertTo-Json | Set-Content -LiteralPath $report -Encoding UTF8
+              }
+            } finally {
+              if ($null -ne $process) {
+                if (-not $process.HasExited) {
+                  $process.Kill($true)
+                  $null = $process.WaitForExit(10000)
+                }
+                $process.Dispose()
+              }
+            }
+          }
+          if ($failures.Count -gt 0) { throw ($failures -join "`n") }
+      - name: Upload packaged diagnostic reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Lyrio-smoke-reports
+          path: dist/self-test-*.json
+          if-no-files-found: ignore
+      - name: Verify assets and generate checksums
+        run: |
+          $names = @('Lyrio.exe', 'Lyrio-Lite.exe')
+          $checksums = foreach ($name in $names) {
+            $asset = Join-Path 'dist' $name
+            if (-not (Test-Path -LiteralPath $asset -PathType Leaf)) { throw "Missing release asset: $asset" }
+            if ((Get-Item -LiteralPath $asset).Length -eq 0) { throw "Empty release asset: $asset" }
+            $hash = (Get-FileHash -LiteralPath $asset -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $name"
+          }
+          [IO.File]::WriteAllLines((Join-Path $PWD 'dist/SHA256SUMS.txt'), $checksums, [Text.UTF8Encoding]::new($false))
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: Lyrio-exe
-          path: dist/Lyrio*.exe
+          path: |
+            dist/Lyrio.exe
+            dist/Lyrio-Lite.exe
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+      - name: Prepare draft release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $release = gh release view "$env:RELEASE_TAG" --json isDraft 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create "$env:RELEASE_TAG" --verify-tag --draft --title "Lyrio $env:RELEASE_TAG" --notes 'Review both Windows editions and SHA256SUMS.txt, then publish this draft to deliver the update.'
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } elseif (-not ($release | ConvertFrom-Json).isDraft) {
+            throw 'This release is already public. Use a new version tag instead of replacing binaries already delivered to users.'
+          }
+          # Keep all uploads in the draft. Publication remains a manual action.
+          gh release upload "$env:RELEASE_TAG" dist/Lyrio.exe dist/Lyrio-Lite.exe --clobber
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          gh release upload "$env:RELEASE_TAG" dist/SHA256SUMS.txt --clobber
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

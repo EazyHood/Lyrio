@@ -12,13 +12,20 @@ import sys
 import threading
 import time
 
+if __name__ == "__main__" and len(sys.argv) == 3 and sys.argv[1] == "--self-test":
+    from diagnostics import run_self_test
+    sys.exit(run_self_test(sys.argv[2]))
+if __name__ == "__main__" and len(sys.argv) == 4 and sys.argv[1] == "--self-test-ai":
+    from diagnostics import run_self_test
+    sys.exit(run_self_test(sys.argv[2], model_path=sys.argv[3]))
+
 from overlay import set_dpi_aware
 set_dpi_aware()   # antes de crear cualquier ventana
 
 import customtkinter as ctk
 
 import i18n
-from appconfig import (Config, set_autostart, CONFIG_DIR,
+from appconfig import (Config, set_autostart, CONFIG_DIR, APP_VERSION,
                        acquire_single_instance, watch_show_event)
 from audiocal import AudioCalibrator
 from autosyncai import AutoSyncAI
@@ -32,6 +39,9 @@ from player import SpotifyWatcher
 from recognize import identify_song
 from tray import Tray
 from ui import MainWindow, BG
+from display_lyrics import prepare_display_lyrics
+from timing import word_progress
+from updater import AutoUpdater, UpdateError, UpdateCancelled
 
 os.makedirs(CONFIG_DIR, exist_ok=True)
 logging.basicConfig(
@@ -69,6 +79,13 @@ class LyrioApp:
         self._offsets = {}             # track_key -> ajuste manual
         self._current_key = None
         self._stop_event = threading.Event()
+        self._display_cache = []
+        self.updater = AutoUpdater(APP_VERSION)
+        self._update_state = "idle" if self.updater.enabled else "unsupported"
+        self._update_detail = {}
+        self._update_wake = threading.Event()
+        self._update_requested = False
+        self._quitting = False
 
         self.root = ctk.CTk()
         self.root.configure(fg_color=BG)
@@ -96,7 +113,6 @@ class LyrioApp:
         self._last_playing_mono = time.monotonic()
         from translate import Translator
         self.translator = Translator()
-        self._rom_cache = {}
         self.party = None              # modo fiesta (pantalla completa)
         self._now = {}                 # estado publico (companero movil)
         from phone import PhoneServer
@@ -132,6 +148,21 @@ class LyrioApp:
         base = float(self.cfg.get("offset_global", 0.0))
         with self._lock:
             return base + self._offsets.get(key, 0.0)
+
+    def display_lyrics(self, lyrics):
+        """Keep display text separate from the source used to edit/publish sync."""
+        if lyrics is None:
+            return None
+        options = (self.cfg.get("romanize", True),
+                   self.cfg.get("romanization_language", "auto"))
+        for source, opts, display in self._display_cache:
+            if source is lyrics and opts == options:
+                return display
+        display = prepare_display_lyrics(lyrics, enabled=options[0],
+                                         language=options[1])
+        self._display_cache.append((lyrics, options, display))
+        self._display_cache = self._display_cache[-4:]
+        return display
 
     @staticmethod
     def line_index(lyrics, pos):
@@ -298,7 +329,7 @@ class LyrioApp:
 
                 threading.Thread(target=work, daemon=True,
                                  name="fetch-2").start()
-        lyr = self._lyrics2
+        lyr = self.display_lyrics(self._lyrics2)
         if not lyr:
             self.overlay2.render("", f"{st.artist} - {st.title}"
                                  if st.artist else st.title,
@@ -313,8 +344,9 @@ class LyrioApp:
             if lyr.lines[j][1]:
                 nxt = lyr.lines[j][1]
                 break
-        self.overlay2.render(current or "…", nxt,
-                             "" if st.playing else t("paused"))
+        self._render_timed_overlay(self.overlay2, lyr, idx, pos, st.duration,
+                                   current or "…", nxt,
+                                   "" if st.playing else t("paused"))
 
     # ------------------------------------- fiesta / movil / updates
 
@@ -343,6 +375,12 @@ class LyrioApp:
 
     def set_romanize(self, on):
         self.cfg.set("romanize", bool(on))
+        self._display_cache.clear()
+
+    def set_romanization_language(self, language):
+        if language in ("auto", "ja", "zh", "ko"):
+            self.cfg.set("romanization_language", language)
+            self._display_cache.clear()
 
     def set_ai_model(self, name):
         self.cfg.set("ai_model", name)
@@ -358,22 +396,55 @@ class LyrioApp:
         self._key2 = None
         self._lyrics2 = None
 
+    def set_auto_update(self, on):
+        self.cfg.set("auto_update", bool(on))
+        self.updater.close()
+        self.updater = AutoUpdater(APP_VERSION)
+        if self._update_state != "ready":
+            self._update_state = ("idle" if on else "disabled") if self.updater.enabled else "unsupported"
+            self._update_detail = {}
+        self.window.refresh_update_status()
+        self._update_wake.set()
+
+    def check_update_now(self):
+        self._update_requested = True
+        self._update_wake.set()
+
+    def _update_status(self, updater, state, detail):
+        if updater is not self.updater or self._stop_event.is_set():
+            return
+        was_ready = self._update_state == "ready"
+        self._update_state, self._update_detail = state, detail
+        self.window.refresh_update_status()
+        if state == "ready" and not was_ready:
+            self.tray.notify(t("update_ready", v=detail.get("version", "")))
+
     def _check_update(self):
-        """Aviso de version nueva en GitHub (a los 12 s de arrancar)."""
-        time.sleep(12)
-        try:
-            import requests
-            from appconfig import APP_VERSION
-            r = requests.get("https://api.github.com/repos/EazyHood/Lyrio"
-                             "/releases/latest", timeout=10)
-            tag = (r.json().get("tag_name") or "").lstrip("v")
-            if tag and tuple(map(int, tag.split("."))) > \
-                    tuple(map(int, APP_VERSION.split("."))):
-                self.ui_call(self.window.flash_status,
-                             t("update_available", v=tag), 12000)
-                self.tray.notify(t("update_available", v=tag))
-        except Exception:
-            pass
+        """One worker: download at launch and every six hours; UI stays free."""
+        self._update_wake.wait(12)
+        while not self._stop_event.is_set():
+            self._update_wake.clear()
+            requested = self._update_requested
+            self._update_requested = False
+            updater = self.updater
+            if self.cfg.get("auto_update", True) or requested:
+                try:
+                    updater.check_and_download(on_status=lambda state, detail, u=updater:
+                        self.ui_call(self._update_status, u, state, detail))
+                except UpdateCancelled:
+                    pass
+                except Exception:
+                    log.exception("No se pudo preparar la actualizacion")
+                    self.ui_call(self._update_status, updater, "error", {})
+            elif updater.enabled:
+                pending = updater.pending_update()
+                if pending:
+                    self.ui_call(self._update_status, updater, "ready",
+                                 {"version": pending.version})
+            self._update_wake.wait(6 * 60 * 60)
+
+    def restart_for_update(self):
+        self.on_quit(restart=True)
 
     # ------------------------------------- identificacion por audio (Shazam)
 
@@ -448,6 +519,9 @@ class LyrioApp:
         """Si la letra es estimada y la cancion va empezando, escuchar el
         audio para encontrar el arranque real de la musica."""
         key = state.track_key
+        with self._lock:
+            if self._offsets.get(key, 0.0):
+                return
         self._cal_state = state
 
         def pos_getter():
@@ -464,17 +538,20 @@ class LyrioApp:
         st = self.watcher.get_state()
         if not st.playing or st.position_now() > 40:
             return
-        self._ai_tried.add(key)
         with self._lock:
             lyr = self._lyrics if self._lyrics_key == key else None
-        if not lyr:
+            if self._offsets.get(key, 0.0):
+                return  # do not apply automatic and user timing corrections twice
+        if not lyr or lyr.source == "user":
             return
+        self._ai_tried.add(key)
 
         def pos_getter():
             now = self.watcher.get_state()
             return now.position_now(), (now.playing and now.track_key == key)
 
-        self.autosync_ai.start(key, pos_getter, lyr.lines, st.duration)
+        self.autosync_ai.start(key, pos_getter, lyr.lines, st.duration,
+                              preserve_line_times=lyr.synced and not lyr.estimated)
 
     def _on_ai_sync(self, key, lines, word_times=None):
         """La IA termino de alinear (hilo propio)."""
@@ -484,10 +561,13 @@ class LyrioApp:
         ref = st or (now if now.track_key == key else None)
         if ref is None:
             return
-        lyr = save_ai_sync(ref.artist, ref.title, ref.duration, lines,
-                           words=word_times)
-        log.info("IA sincronizo: %s (%d lineas)", ref.title, len(lines))
         with self._lock:
+            if self._offsets.get(key, 0.0) or (
+                    self._lyrics_key == key and self._lyrics and self._lyrics.source == "user"):
+                return
+            lyr = save_ai_sync(ref.artist, ref.title, ref.duration, lines,
+                               words=word_times)
+            log.info("IA sincronizo: %s (%d lineas)", ref.title, len(lines))
             if self._lyrics_key == key or self._current_key == key:
                 self._lyrics = lyr
                 self._lyrics_key = key
@@ -498,11 +578,14 @@ class LyrioApp:
         st = self._cal_state
         if not st or st.track_key != key:
             return
-        lyr = apply_anchor(st.artist, st.title, st.duration, anchor)
-        if not lyr:
-            return
-        log.info("Audio-calibracion: %s ancla=%.1fs", st.title, anchor)
         with self._lock:
+            if self._offsets.get(key, 0.0) or (
+                    self._lyrics_key == key and self._lyrics and self._lyrics.source == "user"):
+                return
+            lyr = apply_anchor(st.artist, st.title, st.duration, anchor)
+            if not lyr:
+                return
+            log.info("Audio-calibracion: %s ancla=%.1fs", st.title, anchor)
             if self._lyrics_key == key:
                 self._lyrics = lyr
         self.ui_call(self.window.flash_status, t("calibrated_notice"))
@@ -559,6 +642,9 @@ class LyrioApp:
         st = self.watcher.get_state()
         if not st.title:
             return
+        self.autosync_ai.cancel()
+        self.audiocal.cancel()
+        self._ai_tried.discard(st.track_key)
         clear_cache_entry(st.artist, st.title, st.duration)
         with self._lock:
             self._lyrics = None
@@ -575,6 +661,8 @@ class LyrioApp:
 
     def apply_manual_result(self, key, lyr):
         """Aplica el resultado de la busqueda manual (hilo UI)."""
+        self.autosync_ai.cancel()
+        self.audiocal.cancel()
         with self._lock:
             self._fetching_key = None      # descarta fetch automatico en vuelo
             self._failed.pop(key, None)
@@ -584,11 +672,13 @@ class LyrioApp:
                 self._loaded_at = time.monotonic()
 
     def apply_user_sync(self, track, stamped_lines):
+        self.autosync_ai.cancel()
+        self.audiocal.cancel()
         artist, title, duration = track
-        lyr = save_user_sync(artist, title, duration, stamped_lines,
-                             author=(self.cfg.get("sync_author") or "").strip())
         key = (artist, title, round(duration))
         with self._lock:
+            lyr = save_user_sync(artist, title, duration, stamped_lines,
+                                 author=(self.cfg.get("sync_author") or "").strip())
             self._fetching_key = None      # que ningun fetch viejo la pise
             self._failed.pop(key, None)
             self._offsets.pop(key, None)
@@ -599,9 +689,26 @@ class LyrioApp:
         save_offset(artist, title, duration, 0.0)
         self.window.flash_status(t("sync_saved"))
 
-    def on_quit(self):
+    def on_quit(self, restart=False):
+        if self._quitting:
+            return
+        try:
+            installed = self.updater.install_pending_on_exit(restart=restart)
+            if restart and not installed:
+                self.window.flash_status(t("update_error"), 10000)
+                return
+        except (UpdateError, OSError):
+            log.exception("No se pudo aplicar la actualizacion al salir")
+            if restart:
+                self.window.flash_status(t("update_error"), 10000)
+                return
+        self._quitting = True
         log.info("=== Lyrio cerrando ===")
         self._stop_event.set()
+        self._update_wake.set()
+        self.updater.close()
+        self.autosync_ai.cancel()
+        self.audiocal.cancel()
         try:
             self.phone.stop()
             self.translator.stop()
@@ -625,6 +732,7 @@ class LyrioApp:
         """Llamado desde el hilo del watcher."""
         self.audiocal.cancel()
         self.autosync_ai.cancel()
+        self._ai_tried.clear()
         self._radio = None
         self.translator.reset()
         if _is_ad(state) or state.duration > 1200:
@@ -682,9 +790,11 @@ class LyrioApp:
                                  state.artist, state.title)
             # letra estimada: calibrar rapido con el audio Y lanzar la
             # sincronizacion por IA (escucha la cancion entera y la alinea)
-            if lyr is not None and lyr.estimated:
-                self._maybe_calibrate(state)
-                self._maybe_ai_sync(state)
+            if lyr is not None:
+                if lyr.estimated:
+                    self._maybe_calibrate(state)
+                if lyr.estimated or (not lyr.words and lyr.source != "user"):
+                    self._maybe_ai_sync(state)
 
         threading.Thread(target=work, daemon=True, name="fetch-lyrics").start()
 
@@ -705,7 +815,7 @@ class LyrioApp:
         if not (r and r.get("lyr")):
             return False
         pos = r["song_pos"] + (time.monotonic() - r["at_mono"])
-        lyr = r["lyr"]
+        lyr = self.display_lyrics(r["lyr"])
         last = lyr.lines[-1][0] if lyr.lines else 0
         if pos > last + 20:
             self._radio = None      # la cancion ya debio terminar
@@ -713,10 +823,11 @@ class LyrioApp:
         idx = self.line_index(lyr, pos)
         cur = lyr.lines[idx][1] if idx >= 0 else "…"
         nxt = next((x for _t, x in lyr.lines[idx + 1:] if x), "")
-        self.overlay.render(cur or "…", nxt,
-                            f'♪ {r["artist"]} - {r["title"]}'
-                            if pos - (lyr.lines[0][0] if lyr.lines
-                                      else 0) < 6 else "")
+        self._render_timed_overlay(self.overlay, lyr, idx, pos, 0,
+                                   cur or "…", nxt,
+                                   f'♪ {r["artist"]} - {r["title"]}'
+                                   if pos - (lyr.lines[0][0] if lyr.lines
+                                             else 0) < 6 else "")
         self._now = {"title": r["title"], "artist": r["artist"], "prev": "",
                      "current": cur or "…", "next": nxt, "extra": ""}
         if self.party:
@@ -745,18 +856,9 @@ class LyrioApp:
         identify_song(on_result)
 
     def _extra_line(self, current):
-        """Traduccion o romanizacion de la linea actual (con cache)."""
+        """Translation uses the original script, independent of display mode."""
         if not current or current == "…":
             return ""
-        from translate import needs_romanization, romanize
-        if self.cfg.get("romanize", True) and needs_romanization(current):
-            r = self._rom_cache.get(current)
-            if r is None:
-                r = romanize(current)
-                self._rom_cache[current] = r
-                if len(self._rom_cache) > 200:
-                    self._rom_cache.clear()
-            return r
         if self.cfg.get("translate", False):
             return self.translator.get(current,
                                        self.cfg.get("language", "en"))
@@ -764,27 +866,22 @@ class LyrioApp:
 
     @staticmethod
     def _line_frac(lyr, idx, pos, duration):
-        """Progreso 0..1 dentro de la linea. Si la IA dejo tiempos por
-        PALABRA reales, se usan; si no, se estima por duracion de linea."""
-        text = lyr.lines[idx][1]
-        wt = lyr.words.get(idx) if getattr(lyr, "words", None) else None
-        if wt and text:
-            n = len(text)
-            done = 0
-            for i, (tw, ce) in enumerate(wt):
-                if pos >= tw:
-                    done = ce
-                    nxt = wt[i + 1] if i + 1 < len(wt) else None
-                    if nxt and pos < nxt[0]:
-                        f = (pos - tw) / max(nxt[0] - tw, 0.05)
-                        done = ce + f * (nxt[1] - ce)
-                else:
-                    break
-            return done / n
+        """Elapsed line time for the underline; never invent word onsets."""
         t0 = lyr.lines[idx][0]
         t1 = (lyr.lines[idx + 1][0] if idx + 1 < len(lyr.lines)
               else max(duration, t0 + 5))
-        return (pos - t0) / max(t1 - t0, 0.5)
+        return max(0.0, min(1.0, (pos - t0) / max(t1 - t0, 0.5)))
+
+    def _render_timed_overlay(self, overlay, lyrics, idx, pos, duration,
+                              current, nxt, status="", prev="", extra=""):
+        progress, chars = 0.0, None
+        if 0 <= idx < len(lyrics.lines):
+            progress = self._line_frac(lyrics, idx, pos, duration)
+            chars = word_progress(lyrics.lines[idx][1], lyrics.words.get(idx),
+                                  pos, overlay.ov.get("sweep_mode", "word"))
+        overlay.render(current, nxt, status, prev=prev, extra=extra,
+                       timed=chars is not None)
+        overlay.update_progress(progress, chars)
 
     def _tick(self):
         try:
@@ -832,6 +929,10 @@ class LyrioApp:
                         "spotify" not in (st.source_app or "").lower():
                     self.identify_current(auto=True)
             else:
+                source_lyrics = lyr
+                if lyr.estimated or (not lyr.words and lyr.source != "user"):
+                    self._maybe_ai_sync(st)
+                lyr = self.display_lyrics(lyr)
                 pos = st.position_now() + self.current_offset()
                 idx = self.line_index(lyr, pos)
                 current = lyr.lines[idx][1] if idx >= 0 else ""
@@ -868,18 +969,16 @@ class LyrioApp:
                         if self._radio_render():
                             return
                         self._radio_try()
-                extra = self._extra_line(current)
-                self.overlay.render(current, nxt, status, prev=prev,
-                                    extra=extra)
+                original = source_lyrics.lines[idx][1] if idx >= 0 else ""
+                extra = self._extra_line(original)
+                self._render_timed_overlay(self.overlay, lyr, idx, pos,
+                                           st.duration, current, nxt, status,
+                                           prev=prev, extra=extra)
                 self._now = {"title": st.title, "artist": st.artist,
                              "prev": prev, "current": current, "next": nxt,
                              "extra": extra}
                 if self.party:
                     self.party.render(st.title, st.artist, prev, current, nxt)
-                # progreso dentro de la linea actual (karaoke)
-                if 0 <= idx < len(lyr.lines):
-                    self.overlay.update_progress(
-                        self._line_frac(lyr, idx, pos, st.duration))
 
         # ventana (solo si esta visible)
         try:
@@ -889,7 +988,7 @@ class LyrioApp:
                            if self._lyrics_key == self._current_key else None)
                     fetching = self._fetching_key == self._current_key
                     failed = self._current_key in self._failed
-                self.window.update_now_playing(st, lyr, fetching, failed,
+                self.window.update_now_playing(st, self.display_lyrics(lyr), fetching, failed,
                                                self.current_offset())
         except Exception:
             log.exception("error refrescando ventana")
@@ -899,7 +998,7 @@ def main():
     if not acquire_single_instance():
         # ya hay una instancia: le pedimos que se muestre y salimos
         return
-    log.info("=== Lyrio %s iniciando ===", "2.0")
+    log.info("=== Lyrio %s iniciando ===", APP_VERSION)
     app = LyrioApp()
     app.root.mainloop()
 

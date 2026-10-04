@@ -113,6 +113,8 @@ class LyricsOverlay:
         self._extra = ""              # traduccion / romanizacion de la actual
         self._status = ""
         self._progress = 0.0
+        self._timed = False
+        self._sung_chars = 0.0
         self._progress_geom = None    # (x0, y, maxw) del subrayado
         self._progress_items = None   # (fondo, relleno)
         self._sweep = None            # karaoke: (item, texto, chars_actuales)
@@ -168,30 +170,36 @@ class LyricsOverlay:
 
     # ------------------------------------------------------------- publico
 
-    def render(self, current, nxt, status="", prev="", extra=""):
+    def render(self, current, nxt, status="", prev="", extra="", timed=False):
         if self._destroyed:
             return
         changed_line = current != self._current and current and self._current
-        if (prev, current, nxt, status, extra) == (
+        if (prev, current, nxt, status, extra, timed) == (
                 self._prev, self._current, self._next, self._status,
-                self._extra):
+                self._extra, self._timed):
             return
+        if (prev, current, nxt) != (self._prev, self._current, self._next):
+            self._progress = 0.0
+            self._sung_chars = 0.0
         self._prev, self._current, self._next = prev, current, nxt
         self._status = status
         self._extra = extra
+        self._timed = timed
         if changed_line:
             self._animate_line()
         else:
             self._redraw()
 
-    def update_progress(self, frac):
+    def update_progress(self, frac, sung_chars=None):
         """Progreso dentro de la linea: barrido karaoke o subrayado (barato)."""
         if self._destroyed:
             return
         frac = max(0.0, min(1.0, frac))
-        if abs(frac - self._progress) < 0.01:
+        chars = max(0.0, min(len(self._current), sung_chars or 0.0))
+        if abs(frac - self._progress) < 0.001 and chars == self._sung_chars:
             return
         self._progress = frac
+        self._sung_chars = chars
         try:
             if self._sweep is not None:
                 item, text, shown, words = self._sweep
@@ -207,18 +215,12 @@ class LyricsOverlay:
             pass
 
     def _sweep_chars(self, frac, text, words):
-        """Cuantos caracteres 'cantados' mostrar. Modo word: la palabra entera
-        se enciende al entrar en ella; modo char: barrido letra a letra."""
-        n_raw = frac * len(text)
-        if self.ov.get("sweep_mode", "word") != "word" or not words:
-            return int(round(n_raw))
-        n = 0
-        for s, e in words:
-            if n_raw >= s + 0.35 * (e - s):   # entro a la palabra
-                n = e
-            else:
-                break
-        return n
+        """Only actual word intervals may illuminate lyric text."""
+        count = int(self._sung_chars)
+        if self.ov.get("caps"):
+            # Uppercase can change string length (e.g. ß -> SS).
+            count = len(self._current[:count].upper())
+        return min(count, len(text))
 
     def set_visible(self, visible):
         self.ov["visible"] = bool(visible)
@@ -344,7 +346,7 @@ class LyricsOverlay:
             # animacion: entra deslizandose desde abajo y aclarando el color
             dy = int((1.0 - anim_t) * self.px(16))
             one_row = self.font_main.measure(cur_text) <= wrap
-            karaoke = (one_row and anim_t >= 1.0 and
+            karaoke = (self._timed and one_row and anim_t >= 1.0 and
                        self.ov.get("progress_line", True))
             # con karaoke: la base va atenuada y el barrido la va "cantando"
             base_fill = (_lerp_color(color, "#6a6a6a", 0.55) if karaoke

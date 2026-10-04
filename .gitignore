@@ -2,5 +2,8 @@ __pycache__/
 build/
 dist/
 *.spec
+!lyrio-build.spec
 *.log
 config.json
+_build_info.py
+.pytest_cache/
