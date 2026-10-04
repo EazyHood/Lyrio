@@ -12,8 +12,6 @@ concurrency:
 jobs:
   windows:
     runs-on: windows-latest
-    env:
-      LYRIO_SMOKE_MODEL: ${{ runner.temp }}\LyrioModel
     permissions:
       contents: write
     steps:
@@ -47,6 +45,8 @@ jobs:
         env:
           HF_HUB_DISABLE_IMPLICIT_TOKEN: '1'
         run: |
+          $env:LYRIO_SMOKE_MODEL = Join-Path $env:RUNNER_TEMP 'LyrioModel'
+          "LYRIO_SMOKE_MODEL=$env:LYRIO_SMOKE_MODEL" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           @'
           import json
           import os
