@@ -15,6 +15,9 @@ import time
 if __name__ == "__main__" and len(sys.argv) == 3 and sys.argv[1] == "--self-test":
     from diagnostics import run_self_test
     sys.exit(run_self_test(sys.argv[2]))
+if __name__ == "__main__" and len(sys.argv) == 4 and sys.argv[1] == "--self-test-ai":
+    from diagnostics import run_self_test
+    sys.exit(run_self_test(sys.argv[2], model_path=sys.argv[3]))
 
 from overlay import set_dpi_aware
 set_dpi_aware()   # antes de crear cualquier ventana

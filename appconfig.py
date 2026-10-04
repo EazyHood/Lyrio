@@ -14,7 +14,7 @@ CONFIG_DIR = os.path.join(os.environ.get("APPDATA", "."), "Lyrio")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 
 APP_NAME = "Lyrio"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 
 MUTEX_NAME = "Local\\Lyrio_SingleInstance"
 SHOW_EVENT_NAME = "Local\\Lyrio_ShowWindow"

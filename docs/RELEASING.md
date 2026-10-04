@@ -5,7 +5,7 @@ El actualizador consume únicamente versiones estables publicadas en `EazyHood/L
 1. Actualiza `APP_VERSION` en `appconfig.py` y `AppVersion` en `installer.iss` con el mismo número `X.Y.Z`.
 2. Con Python 3.12 en Windows x64, instala `requirements-build.txt` y ejecuta `python -m unittest discover -s tests -v` y `python -m pip check`.
 3. Revisa y fusiona el código. Crea y sube un tag `vX.Y.Z` sobre ese commit.
-4. El workflow `build` verifica que el tag coincide, ejecuta las pruebas, compila ambas ediciones y comprueba cada ejecutable sin abrir ventanas ni capturar audio. Crea un **borrador** de release con `Lyrio.exe`, `Lyrio-Lite.exe` y `SHA256SUMS.txt`. También guarda los tres archivos como artefacto de Actions.
+4. El workflow `build` verifica que el tag coincide, ejecuta las pruebas, compila ambas ediciones y comprueba cada ejecutable sin abrir ventanas ni capturar audio. En Full también carga un modelo real y ejecuta inferencia nativa. Exige que el proceso termine correctamente y elimine su directorio temporal. Crea un **borrador** de release con `Lyrio.exe`, `Lyrio-Lite.exe` y `SHA256SUMS.txt`. También guarda los tres archivos como artefacto de Actions.
 5. Descarga y prueba ambas ediciones. Revisa las notas y **publica el borrador** cuando estén listas. La publicación sigue siendo una acción tuya; el workflow no la realiza.
 
 El manifiesto contiene una línea SHA-256 por ejecutable, con dos espacios antes del nombre. Lo genera el workflow después de compilar. Conserva los nombres exactos de los tres archivos. No reemplaces archivos de una release ya publicada: utiliza un nuevo número y tag; el workflow lo exige.
@@ -13,6 +13,18 @@ El manifiesto contiene una línea SHA-256 por ejecutable, con dos espacios antes
 Para comprobar una build sin publicar, ejecuta el workflow manualmente sobre una rama; al no ser un tag, solo genera el artefacto de Actions.
 
 La comprobación offline del paquete también se puede ejecutar localmente con `Lyrio.exe --self-test resultado.json` (o `Lyrio-Lite.exe`). Escribe un informe de dependencias, diccionarios, canal y versión; no inicia la interfaz ni descarga modelos.
+
+## Runtime de Windows y prueba de inferencia
+
+Ambas ediciones se compilan mediante `lyrio-build.spec`. La build incorpora un único conjunto x64 del runtime de Microsoft C++ **14.40 o posterior** y reemplaza también las copias incluidas dentro de paquetes como `winrt`. Una copia antigua junto a WinRT puede cargarse antes que CTranslate2 y cerrar el proceso al iniciar el modelo; incluir otra copia nueva en la raíz no basta.
+
+Por defecto se toma el runtime instalado en `%SystemRoot%\System32` del equipo de compilación. Para fijar un conjunto redistribuible concreto, define `LYRIO_MSVC_RUNTIME_DIR` con la carpeta que contiene sus DLL x64 antes de ejecutar `build.bat` o `build_lite.bat`. Usa los redistribuibles oficiales de Microsoft. El script valida arquitectura y versiones coherentes, impide degradar cualquier DLL encontrada por PyInstaller y falla si falta un archivo. No modifica Windows ni los paquetes Python. Los nombres privados con sufijo de hash se conservan.
+
+Microsoft exige que el [runtime sea al menos tan reciente como las herramientas usadas por los componentes](https://learn.microsoft.com/en-us/cpp/porting/binary-compat-2015-2017). Al actualizar dependencias nativas, comprueba también la inicialización y transcripción con el modelo en el ejecutable compilado.
+
+Importar `WhisperModel` no prueba la carga ni la ejecución del modelo nativo. Para esa regresión, ejecuta `Lyrio.exe --self-test-ai resultado-ia.json RUTA_DEL_MODELO` con una carpeta de modelo CTranslate2 ya descargada. La prueba carga el modelo y procesa audio sintético en memoria; no escucha el micrófono ni la música del equipo. El informe debe indicar `ai_inference: true`. Espera también a que termine el proceso padre con código cero y comprueba que la ruta `extraction_dir` del informe ya no exista: escribir el informe no demuestra por sí solo que el cierre haya funcionado.
+
+CI descarga únicamente los cuatro archivos necesarios del modelo público [Systran/faster-whisper-tiny](https://huggingface.co/Systran/faster-whisper-tiny), con la revisión fijada en el workflow, y comprueba que estén completos antes de probar el ejecutable. La inferencia posterior es local y funciona con el acceso al Hub desactivado. Los informes de las dos ediciones y de la inferencia Full se guardan en `Lyrio-smoke-reports` incluso si falla la comprobación; un fallo impide preparar los binarios de la release.
 
 ## Comportamiento del actualizador
 

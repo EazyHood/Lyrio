@@ -12,6 +12,8 @@ concurrency:
 jobs:
   windows:
     runs-on: windows-latest
+    env:
+      LYRIO_SMOKE_MODEL: ${{ runner.temp }}\LyrioModel
     permissions:
       contents: write
     steps:
@@ -41,58 +43,101 @@ jobs:
         run: cmd /c build.bat
       - name: Build lite exe
         run: cmd /c build_lite.bat
+      - name: Download native inference smoke model
+        env:
+          HF_HUB_DISABLE_IMPLICIT_TOKEN: '1'
+        run: |
+          @'
+          import json
+          import os
+          from pathlib import Path
+          from huggingface_hub import snapshot_download
+
+          files = ["config.json", "model.bin", "tokenizer.json", "vocabulary.txt"]
+          model = Path(snapshot_download(
+              "Systran/faster-whisper-tiny",
+              revision="d90ca5fe260221311c53c58e660288d3deb8d356",
+              local_dir=os.environ["LYRIO_SMOKE_MODEL"],
+              allow_patterns=files,
+              token=False,
+          ))
+          for name in files:
+              path = model / name
+              assert path.is_file() and path.stat().st_size > 0, f"Incomplete model: {name}"
+          assert (model / "model.bin").stat().st_size > 1_000_000, "Missing native model weights"
+          for name in ("config.json", "tokenizer.json"):
+              json.loads((model / name).read_text(encoding="utf-8"))
+          print("Pinned tiny model is ready for offline native inference")
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Smoke test packaged applications
         run: |
           $versionMatch = [regex]::Match((Get-Content -LiteralPath 'appconfig.py' -Raw), '(?m)^APP_VERSION\s*=\s*"([^"]+)"')
           if (-not $versionMatch.Success) { throw 'Could not read APP_VERSION' }
           $expectedVersion = $versionMatch.Groups[1].Value
           $failures = [Collections.Generic.List[string]]::new()
-          $editions = @(
-            @{ Name = 'Lyrio.exe'; Channel = 'full'; Ai = $true },
-            @{ Name = 'Lyrio-Lite.exe'; Channel = 'lite'; Ai = $false }
+          $checks = @(
+            @{ Name = 'Lyrio.exe'; Channel = 'full'; Ai = $true; Id = 'full'; NativeInference = $false },
+            @{ Name = 'Lyrio-Lite.exe'; Channel = 'lite'; Ai = $false; Id = 'lite'; NativeInference = $false },
+            @{ Name = 'Lyrio.exe'; Channel = 'full'; Ai = $true; Id = 'full-ai'; NativeInference = $true }
           )
-          foreach ($edition in $editions) {
-            $report = [IO.Path]::GetFullPath((Join-Path 'dist' ('self-test-' + $edition.Channel + '.json')))
+          foreach ($check in $checks) {
+            $report = [IO.Path]::GetFullPath((Join-Path 'dist' ('self-test-' + $check.Id + '.json')))
             $process = $null
             try {
               Remove-Item -LiteralPath $report -Force -ErrorAction SilentlyContinue
               $sandbox = Join-Path $env:RUNNER_TEMP ('lyrio-smoke-' + [Guid]::NewGuid().ToString('N'))
               $roaming = Join-Path $sandbox 'Roaming'
               $local = Join-Path $sandbox 'Local'
-              New-Item -ItemType Directory -Path $roaming, $local -Force | Out-Null
+              $temporary = Join-Path $sandbox 'Temp'
+              New-Item -ItemType Directory -Path $roaming, $local, $temporary -Force | Out-Null
               $start = [Diagnostics.ProcessStartInfo]::new()
-              $start.FileName = [IO.Path]::GetFullPath((Join-Path 'dist' $edition.Name))
+              $start.FileName = [IO.Path]::GetFullPath((Join-Path 'dist' $check.Name))
               $start.WorkingDirectory = $PWD.Path
               $start.UseShellExecute = $false
               $start.CreateNoWindow = $true
               $start.WindowStyle = [Diagnostics.ProcessWindowStyle]::Hidden
-              $start.ArgumentList.Add('--self-test')
+              if ($check.NativeInference) { $start.ArgumentList.Add('--self-test-ai') }
+              else { $start.ArgumentList.Add('--self-test') }
               $start.ArgumentList.Add($report)
+              if ($check.NativeInference) { $start.ArgumentList.Add($env:LYRIO_SMOKE_MODEL) }
               $start.Environment['APPDATA'] = $roaming
               $start.Environment['LOCALAPPDATA'] = $local
+              $start.Environment['TEMP'] = $temporary
+              $start.Environment['TMP'] = $temporary
+              $start.Environment['HF_HUB_OFFLINE'] = '1'
               $start.Environment['PYINSTALLER_RESET_ENVIRONMENT'] = '1'
               $process = [Diagnostics.Process]::Start($start)
-              if (-not $process.WaitForExit(120000)) {
+              $timeout = if ($check.NativeInference) { 300000 } else { 120000 }
+              if (-not $process.WaitForExit($timeout)) {
                 # Kill only this launched process and its own PyInstaller child.
                 $process.Kill($true)
                 $null = $process.WaitForExit(10000)
-                throw 'Packaged self-test timed out after 120 seconds'
+                throw "Packaged self-test timed out after $($timeout / 1000) seconds"
               }
               if ($process.ExitCode -ne 0) { throw "Packaged self-test exited with code $($process.ExitCode)" }
               if (-not (Test-Path -LiteralPath $report -PathType Leaf)) { throw 'Packaged self-test did not write a report' }
               $result = Get-Content -LiteralPath $report -Raw -Encoding UTF8 | ConvertFrom-Json
               if ($result.status -ne 'passed' -or $result.version -ne $expectedVersion -or
-                  $result.channel -ne $edition.Channel -or $result.automatic_updates -ne $true -or
-                  $result.ai_available -ne $edition.Ai) {
+                  $result.channel -ne $check.Channel -or $result.automatic_updates -ne $true -or
+                  $result.ai_available -ne $check.Ai -or
+                  ($check.NativeInference -and $result.ai_inference -ne $true)) {
                 throw "Packaged self-test report is invalid: $(Get-Content -LiteralPath $report -Raw)"
               }
-              Write-Host "$($edition.Name): offline self-test passed"
+              # The report is written by the Python child. The parent must also
+              # exit successfully and remove its extraction directory afterward.
+              if (-not $result.extraction_dir -or
+                  (Test-Path -LiteralPath $result.extraction_dir) -or
+                  @(Get-ChildItem -LiteralPath $temporary -Directory -Filter '_MEI*').Count -ne 0) {
+                throw 'Packaged self-test left its PyInstaller extraction directory behind'
+              }
+              Write-Host "$($check.Id): offline self-test and package cleanup passed"
             } catch {
-              $message = "$($edition.Name): $($_.Exception.Message)"
+              $message = "$($check.Id): $($_.Exception.Message)"
               $failures.Add($message)
               Write-Warning $message
               if (-not (Test-Path -LiteralPath $report)) {
-                @{ status = 'failed'; channel = $edition.Channel; error = $message } |
+                @{ status = 'failed'; channel = $check.Channel; error = $message } |
                   ConvertTo-Json | Set-Content -LiteralPath $report -Encoding UTF8
               }
             } finally {

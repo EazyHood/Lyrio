@@ -3,7 +3,7 @@
 
 [Setup]
 AppName=Lyrio
-AppVersion=1.2.0
+AppVersion=1.2.1
 AppPublisher=EazyHood
 AppPublisherURL=https://github.com/EazyHood/Lyrio
 ; Updates run as the current user. Avoid a protected Program Files destination.
