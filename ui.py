@@ -218,6 +218,7 @@ class MainWindow:
         self._track_shown = _SENTINEL
         self._art_key = None
         self._panel_mode = None
+        self._lyrics_shown = None
         self._flash_until = 0.0
         self._user_scroll_at = 0.0
         self._scroll_anim = None
@@ -669,6 +670,17 @@ class MainWindow:
         self.romanize_switch.pack(anchor="w", padx=20, pady=(0, 4))
         if self.cfg.get("romanize", True):
             self.romanize_switch.select()
+        rrow = ctk.CTkFrame(cx, fg_color="transparent")
+        rrow.pack(fill="x", padx=20, pady=(0, 10))
+        self.lbl_romanization_language = ctk.CTkLabel(
+            rrow, text="", font=_font(12), text_color=MUTED)
+        self.lbl_romanization_language.pack(side="left")
+        self.romanization_menu = ctk.CTkOptionMenu(
+            rrow, values=["auto", "ja", "zh", "ko"],
+            command=self._on_romanization_language, width=160, height=28,
+            fg_color=CARD_2, button_color=BORDER, text_color=TEXT,
+            font=_font(12))
+        self.romanization_menu.pack(side="left", padx=12)
         prow = ctk.CTkFrame(cx, fg_color="transparent")
         prow.pack(fill="x", padx=20, pady=(0, 4))
         self.phone_switch = ctk.CTkSwitch(
@@ -724,6 +736,33 @@ class MainWindow:
             fg_color=CARD_2, hover_color=BORDER, text_color=TEXT,
             font=_font(12), command=self._clear_cache)
         self.btn_clear_cache.pack(side="left", padx=12)
+
+        # actualizaciones: persistent progress, never close a song automatically
+        cu = card()
+        sec(cu, "lbl_updates")
+        self.auto_update_switch = ctk.CTkSwitch(
+            cu, text="", progress_color=ACCENT, font=_font(13),
+            text_color=TEXT, command=lambda: self.app.set_auto_update(
+                bool(self.auto_update_switch.get())))
+        self.auto_update_switch.pack(anchor="w", padx=20, pady=(0, 8))
+        if self.cfg.get("auto_update", True):
+            self.auto_update_switch.select()
+        self.update_status = ctk.CTkLabel(
+            cu, text="", font=_font(12), text_color=MUTED,
+            anchor="w", justify="left", wraplength=700)
+        self.update_status.pack(fill="x", padx=20, pady=(0, 10))
+        urow = ctk.CTkFrame(cu, fg_color="transparent")
+        urow.pack(fill="x", padx=20, pady=(0, 16))
+        self.btn_check_update = ctk.CTkButton(
+            urow, text="", width=180, height=30, corner_radius=15,
+            fg_color=CARD_2, hover_color=BORDER, text_color=TEXT,
+            font=_font(12), command=self.app.check_update_now)
+        self.btn_check_update.pack(side="left")
+        self.btn_restart_update = ctk.CTkButton(
+            urow, text="", width=180, height=30, corner_radius=15,
+            fg_color=ACCENT, text_color=("#ffffff", "#08130c"),
+            font=_font(12), command=self.app.restart_for_update)
+        self.btn_restart_update.pack(side="left", padx=12)
 
         # acerca de
         c5 = card()
@@ -805,12 +844,24 @@ class MainWindow:
         self.lbl_extras.configure(text=t("lbl_extras").upper())
         self.translate_switch.configure(text=t("translate_label"))
         self.romanize_switch.configure(text=t("romanize_label"))
+        self.lbl_romanization_language.configure(text=t("romanization_language"))
+        self.romanization_menu.configure(values=[t("roman_lang_" + k)
+                                                for k in ("auto", "ja", "zh", "ko")])
+        roman_lang = self.cfg.get("romanization_language", "auto")
+        if roman_lang not in ("auto", "ja", "zh", "ko"):
+            roman_lang = "auto"
+        self.romanization_menu.set(t("roman_lang_" + roman_lang))
         self.phone_switch.configure(text=t("phone_label"))
         self.btn_qr.configure(text=t("phone_qr_btn"))
         self.lbl_ai_model.configure(text=t("ai_model_label"))
         self.btn_party.configure(text=t("party_mode"))
         self.autostart_switch.configure(text=t("autostart"))
         self.hotkeys_switch.configure(text=t("hotkeys_label"))
+        self.lbl_updates.configure(text=t("updates_title").upper())
+        self.auto_update_switch.configure(text=t("auto_update_label"))
+        self.btn_check_update.configure(text=t("update_check"))
+        self.btn_restart_update.configure(text=t("update_restart"))
+        self.refresh_update_status()
         self.btn_clear_cache.configure(text=t("clear_cache_btn"))
         self._refresh_cache_label()
         self.lbl_about.configure(text=t("about").upper())
@@ -832,6 +883,30 @@ class MainWindow:
     def _clear_cache(self):
         clear_cache()
         self._refresh_cache_label()
+
+    def _on_romanization_language(self, label):
+        for key in ("auto", "ja", "zh", "ko"):
+            if label == t("roman_lang_" + key):
+                self.app.set_romanization_language(key)
+                break
+
+    def refresh_update_status(self):
+        state = self.app._update_state
+        detail = self.app._update_detail
+        if not self.app.updater.enabled:
+            state = "unsupported"
+        elif state == "idle" and not self.cfg.get("auto_update", True):
+            state = "disabled"
+        if state == "downloading":
+            total = detail.get("total", 0)
+            percent = int(100 * detail.get("downloaded", 0) / total) if total else 0
+            message = t("update_downloading", percent=percent)
+        else:
+            message = t("update_" + state, v=detail.get("version", ""))
+        self.update_status.configure(text=message)
+        self.btn_check_update.configure(state="disabled" if state in (
+            "checking", "downloading", "unsupported") else "normal")
+        self.btn_restart_update.configure(state="normal" if state == "ready" else "disabled")
 
     # ============================================================ en vivo
 
@@ -880,8 +955,10 @@ class MainWindow:
             mode = "searching"
         else:
             mode = "no_lyrics"
-        if mode != self._panel_mode:
+        if mode != self._panel_mode or lyrics is not self._lyrics_shown:
             self._panel_mode = mode
+            self._lyrics_shown = lyrics
+            self._hl_lines_idx = -1
             self._render_panel(mode, lyrics)
 
         self._update_badge(state, lyrics, fetching, failed)

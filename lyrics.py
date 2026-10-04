@@ -15,12 +15,14 @@ cache, para que 'Buscar de nuevo' no los borre).
 """
 import hashlib
 import json
+import math
 import os
 import re
 import unicodedata
 from itertools import chain
 
 import requests
+from timing import normalize_word_timings
 
 UA = {"User-Agent": "Lyrio/2.0"}
 BASE_DIR = os.path.join(os.environ.get("LOCALAPPDATA", "."), "Lyrio")
@@ -29,13 +31,10 @@ OFFSETS_PATH = os.path.join(BASE_DIR, "offsets.json")
 
 DURATION_TOLERANCE = 7          # segundos para aceptar una letra sincronizada
 
-TS_MS = re.compile(r"\[(\d+):(\d{1,2})\.(\d{1,3})\]")          # [mm:ss.frac]
-TS_HMS = re.compile(r"\[(\d+):(\d{1,2}):(\d{1,2})(?:\.(\d{1,3}))?\]")  # [h:mm:ss]
-TS_M = re.compile(r"\[(\d+):(\d{1,2})\]")                      # [mm:ss]
 TS_ANY = re.compile(r"\[\d+:\d{1,2}(?::\d{1,2})?(?:\.\d{1,3})?\]")
 OFFSET_TAG = re.compile(r"\[offset:\s*([+-]?\d+)\s*\]", re.IGNORECASE)
 BY_TAG = re.compile(r"\[by:\s*([^\]]+)\]", re.IGNORECASE)
-WORD_TS_RE = re.compile(r"<\d+:\d{1,2}(?:[.:]\d{1,3})?>")
+WORD_TS_RE = re.compile(r"<(\d+):(\d{1,2})(?:[.:](\d{1,3}))?>")
 PAREN_NOISE_RE = re.compile(
     r"\s*[\(\[\-–—]\s*(feat\.?|ft\.?|with|con)\s+[^)\]]*[\)\]]?\s*$", re.IGNORECASE)
 SUFFIX_NOISE_RE = re.compile(
@@ -53,13 +52,25 @@ class Lyrics:
         self.synced = synced          # True si trae tiempos reales
         self.estimated = estimated    # True si los tiempos son estimados
         self.author = author          # firma [by:] de quien la sincronizo
-        # tiempos por PALABRA de la IA: {linea: [(t, char_fin), ...]}
-        self.words = words or {}
+        # Canonical timing: {line: [(start, end, char_start, char_end), ...]}.
+        # Old cache pairs remain readable as onset-only events.
+        self.words = {}
+        if isinstance(words, dict):
+            for key, entries in words.items():
+                try:
+                    index = int(key)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if not 0 <= index < len(self.lines):
+                    continue
+                clean = normalize_word_timings(self.lines[index][1], entries)
+                if clean:
+                    self.words[index] = clean
 
     def to_dict(self):
         d = {"lines": self.lines, "source": self.source,
              "synced": self.synced, "estimated": self.estimated,
-             "author": self.author}
+             "author": self.author, "timing_version": 2}
         if self.words:
             d["words"] = {str(k): v for k, v in self.words.items()}
         return d
@@ -67,14 +78,21 @@ class Lyrics:
     @staticmethod
     def from_dict(d):
         lines = [(float(t), str(x)) for t, x in d.get("lines", [])]
-        words = {}
+        if any(not math.isfinite(t) or t < 0 for t, _ in lines):
+            raise ValueError("Invalid lyric timestamp")
+        if any(a[0] > b[0] for a, b in zip(lines, lines[1:])):
+            raise ValueError("Unordered lyric timestamps")
+        words = d.get("words") or {}
+        # Legacy AI caches may contain interpolated lines with no vocal
+        # anchors. Keep them readable but do not claim they are real sync.
         try:
-            for k, v in (d.get("words") or {}).items():
-                words[int(k)] = [(float(t), int(c)) for t, c in v]
-        except Exception:
-            words = {}
+            timing_version = int(d.get("timing_version", 0))
+        except (TypeError, ValueError, OverflowError):
+            timing_version = 0
+        legacy_ai = d.get("source") == "ai" and timing_version < 2
         return Lyrics(lines, str(d.get("source", "cache")),
-                      bool(d.get("synced")), bool(d.get("estimated")),
+                      bool(d.get("synced")) and not legacy_ai,
+                      bool(d.get("estimated")) or legacy_ai,
                       str(d.get("author", "")), words)
 
 
@@ -169,10 +187,16 @@ def lrc_author(text: str) -> str:
 
 
 def parse_lrc(text: str):
-    """Devuelve [(segundos, linea)] ordenado.
+    """Return sorted line timestamps; use parse_lrc_timing for word data."""
+    return parse_lrc_timing(text)[0]
+
+
+def parse_lrc_timing(text: str):
+    """Return (lines, word intervals), preserving Enhanced LRC timestamps.
 
     Soporta [mm:ss], [mm:ss.frac], [h:mm:ss(.frac)], varias marcas por linea,
-    la etiqueta [offset:±ms], y descarta metadatos ([ar:], [ti:], ...).
+    y [offset:±ms]. Inline times are absolute; repeated line tags shift their
+    word times by the same delta. A missing last word end stays onset-only.
     """
     text = text or ""
     offset = 0.0
@@ -184,24 +208,54 @@ def parse_lrc(text: str):
             pass
 
     out = []
+
+    def word_stamp(match):
+        mm, ss, frac = match.groups()
+        return (int(mm) * 60 + int(ss)
+                + int((frac or "0").ljust(3, "0")) / 1000.0)
+
     for raw in text.splitlines():
         times = []
-        for mm, ss, frac in TS_MS.findall(raw):
-            times.append(int(mm) * 60 + int(ss)
-                         + int(frac.ljust(3, "0")[:3]) / 1000.0)
-        for hh, mm, ss, frac in TS_HMS.findall(raw):
-            times.append(int(hh) * 3600 + int(mm) * 60 + int(ss)
-                         + int((frac or "0").ljust(3, "0")[:3]) / 1000.0)
-        for mm, ss in TS_M.findall(raw):
-            times.append(int(mm) * 60 + int(ss))
+        for tag in TS_ANY.finditer(raw):
+            parts = tag.group()[1:-1].split(":")
+            seconds = float(parts[-1])
+            minutes = int(parts[-2])
+            hours = int(parts[0]) if len(parts) == 3 else 0
+            times.append(hours * 3600 + minutes * 60 + seconds)
         if not times:
             continue
-        line = TS_ANY.sub("", raw)
-        line = WORD_TS_RE.sub("", line).strip()
+        body = TS_ANY.sub("", raw)
+        tags = list(WORD_TS_RE.finditer(body))
+        untrimmed = WORD_TS_RE.sub("", body)
+        trim_left = len(untrimmed) - len(untrimmed.lstrip())
+        line = untrimmed.strip()
+        inline = []
+        cursor = len(body[:tags[0].start()]) if tags else 0
+        for index, tag in enumerate(tags):
+            next_tag = tags[index + 1] if index + 1 < len(tags) else None
+            segment = body[tag.end():next_tag.start() if next_tag else len(body)]
+
+            start = word_stamp(tag)
+            end = word_stamp(next_tag) if next_tag else start
+            cs = cursor + len(segment) - len(segment.lstrip()) - trim_left
+            ce = cursor + len(segment.rstrip()) - trim_left
+            if cs < ce:
+                inline.append((start, end, cs, ce))
+            cursor += len(segment)
         for t in times:
-            out.append((max(0.0, t - offset), line))
+            delta = t - times[0] - offset
+            words = [(max(0.0, start + delta), max(0.0, end + delta), cs, ce)
+                     for start, end, cs, ce in inline]
+            out.append((max(0.0, t - offset), line,
+                        normalize_word_timings(line, words)))
     out.sort(key=lambda p: p[0])
-    return out
+    return ([(t, line) for t, line, _words in out],
+            {index: words for index, (_t, _line, words) in enumerate(out) if words})
+
+
+def _lrc_result(text, source):
+    lines, words = parse_lrc_timing(text)
+    return Lyrics(lines, source, True, author=lrc_author(text), words=words)
 
 
 def autosync(plain: str, duration: float):
@@ -290,19 +344,20 @@ def _musixmatch(artist, title, duration):
         return None
     try:
         lrc = syncedlyrics.search(f"{artist} {_clean_title(title)}",
-                                  providers=["Musixmatch"])
+                                  providers=["Musixmatch"], enhanced=True)
     except Exception:
         return None
     if not lrc:
         return None
-    parsed = parse_lrc(lrc)
+    result = _lrc_result(lrc, "musixmatch")
+    parsed = result.lines
     if sum(1 for _, ln in parsed if ln) < 6:
         return None
     if duration:
         last = parsed[-1][0]
         if last > duration + 15 or last < duration * 0.3:
             return None       # tiempos de otra grabacion
-    return parsed
+    return result
 
 
 def _netease(artist, title, duration):
@@ -332,9 +387,9 @@ def _netease(artist, title, duration):
             lrc = ((r2.json().get("lrc") or {}).get("lyric")) or ""
         except (requests.RequestException, ValueError, KeyError):
             continue
-        parsed = parse_lrc(lrc)
-        if sum(1 for _, ln in parsed if ln) >= 8:
-            return parsed
+        result = _lrc_result(lrc, "netease")
+        if sum(1 for _, ln in result.lines if ln) >= 8:
+            return result
     return None
 
 
@@ -393,10 +448,9 @@ def fetch_lyrics(artist, title, album="", duration=0.0, use_cache=True,
         plain = rec.get("plainLyrics") or ""
         rec_dur = rec.get("duration")
         if synced and (rec_dur is None or _duration_ok(rec_dur, duration)):
-            parsed = parse_lrc(synced)
-            if parsed:
-                return _save(cpath, Lyrics(parsed, "lrclib", True,
-                                           author=lrc_author(synced)))
+            result = _lrc_result(synced, "lrclib")
+            if result.lines:
+                return _save(cpath, result)
         if plain and not plain_fallback:
             plain_fallback = (plain, "lrclib")
 
@@ -417,18 +471,18 @@ def fetch_lyrics(artist, title, album="", duration=0.0, use_cache=True,
             return None
         if res.get("artist") and not _artists_match(artist, res["artist"]):
             return None
-        parsed = parse_lrc(res["lyrics"])
+        result = _lrc_result(res["lyrics"], name)
+        parsed = result.lines
         good = sum(1 for _, ln in parsed if ln) >= 6
         if good and duration and parsed:
             last = parsed[-1][0]
             good = last <= duration + 15 and last >= duration * 0.3
         if good:
-            return Lyrics(parsed, name, True, author=lrc_author(res["lyrics"]))
+            return result
         return None
 
     def _try_mxm():
-        parsed = _musixmatch(artist, title, duration)
-        return Lyrics(parsed, "musixmatch", True) if parsed else None
+        return _musixmatch(artist, title, duration)
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
     jobs = {}
@@ -459,9 +513,9 @@ def fetch_lyrics(artist, title, album="", duration=0.0, use_cache=True,
         return None
 
     # NetEase (sincronizada, con artista y duracion compatibles)
-    parsed = _netease(artist, title, duration)
-    if parsed:
-        return _save(cpath, Lyrics(parsed, "netease", True))
+    result = _netease(artist, title, duration)
+    if result:
+        return _save(cpath, result)
 
     if stale():
         return None
@@ -563,10 +617,12 @@ def clear_cache_entry(artist, title, duration):
 
 def save_ai_sync(artist, title, duration, lines, words=None):
     """Guarda la sincronizacion hecha por la IA escuchando la cancion."""
-    lines = sorted(((round(float(t), 2), str(x)) for t, x in lines),
-                   key=lambda p: p[0])
-    lyr = Lyrics([list(p) for p in lines], "ai", True, estimated=False,
-                 author="Lyrio AI", words=words)
+    ordered = sorted(enumerate(lines), key=lambda item: float(item[1][0]))
+    word_map = {new: (words or {}).get(old, [])
+                for new, (old, _line) in enumerate(ordered)}
+    lines = [(float(t), str(text)) for _old, (t, text) in ordered]
+    lyr = Lyrics(lines, "ai", True, estimated=False,
+                 author="Lyrio AI", words=word_map)
     return _save(_cache_path(artist, title, duration), lyr)
 
 

@@ -4,3 +4,5 @@ dist/
 *.spec
 *.log
 config.json
+_build_info.py
+.pytest_cache/

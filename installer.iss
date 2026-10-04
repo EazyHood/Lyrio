@@ -3,10 +3,11 @@
 
 [Setup]
 AppName=Lyrio
-AppVersion=1.1.0
+AppVersion=1.2.0
 AppPublisher=EazyHood
 AppPublisherURL=https://github.com/EazyHood/Lyrio
-DefaultDirName={autopf}\Lyrio
+; Updates run as the current user. Avoid a protected Program Files destination.
+DefaultDirName={localappdata}\Programs\Lyrio
 DefaultGroupName=Lyrio
 UninstallDisplayIcon={app}\Lyrio.exe
 OutputBaseFilename=Lyrio-Setup
