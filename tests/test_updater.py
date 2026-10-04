@@ -244,7 +244,9 @@ class UpdaterTests(_UpdaterFixture, unittest.TestCase):
         self.assertTrue(kwargs['creationflags'] & subprocess.CREATE_NO_WINDOW)
         self.assertEqual(kwargs['env']['PYINSTALLER_RESET_ENVIRONMENT'], '1')
         plan = json.loads((client.directory / 'install-plan.json').read_text(encoding='utf-8'))
-        self.assertEqual(plan['target'], str(self.target))
+        # Hosted Windows runners may expose %TEMP% through an 8.3 short path.
+        # The installer intentionally writes the canonical long target path.
+        self.assertEqual(plan['target'], str(self.target.resolve()))
         self.assertTrue(plan['restart'])
 
 
